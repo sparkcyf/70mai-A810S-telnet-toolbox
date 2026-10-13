@@ -27,6 +27,9 @@
 
 下面所有命令都在仓库根目录执行。
 
+隐藏入口的逆向分析过程和实测依据，见英文文章
+[Finding the factory-mode entry and USB serial command interface](docs/factory-mode-and-usb-serial-discovery.md)。
+
 ---
 
 ## 第一部分：开启 Telnet

@@ -37,6 +37,9 @@ Before you start:
 
 Run every command below from the top of this repo.
 
+For the reverse-engineering process behind the hidden entry, see
+[Finding the factory-mode entry and USB serial command interface](docs/factory-mode-and-usb-serial-discovery.md).
+
 ---
 
 ## Part 1: Enable Telnet
