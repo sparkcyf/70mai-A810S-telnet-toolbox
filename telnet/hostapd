@@ -1,0 +1,12 @@
+#!/bin/sh
+# 70mai Telnet hook: installed ahead of /mnt/app/bin in the normal PATH.
+# The vendor hostapd binary and all its arguments are preserved.
+case "$1" in
+    ''|-h|-v|--help|--version|stop) ;;
+    *)
+        if [ -x /usr/bin/70mai-telnet-start ] && [ ! -e /usr/bin/70mai-telnet.disabled ]; then
+            /bin/sh /usr/bin/70mai-telnet-start </dev/null >>/var/run/70mai-telnet.log 2>&1 &
+        fi
+        ;;
+esac
+exec /mnt/app/bin/hostapd "$@"

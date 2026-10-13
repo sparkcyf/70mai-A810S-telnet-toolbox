@@ -1,0 +1,37 @@
+#!/bin/sh
+# Start the speed-screensaver overlay once per boot, after main_app is up.
+# Disable: create /mnt/sd/ssoverlay.off (SD card) or /usr/bin/ssoverlay.disabled.
+cd /
+[ -e /usr/bin/ssoverlay.disabled ] && exit 0
+mkdir /var/run/ssoverlay.lock 2>/dev/null || exit 0
+log=/tmp/ssoverlay.log
+want=40c91047536e78e80572363fe2ee8a4b
+
+pid=
+i=0
+while [ "$i" -lt 120 ]; do
+    pid=$(pidof main_app)
+    [ -n "$pid" ] && break
+    i=$((i + 1))
+    sleep 1
+done
+[ -n "$pid" ] || { echo "main_app not found" >>"$log"; exit 0; }
+sleep 20  # let recording come up first
+
+sdlog=
+if grep -q ' /mnt/sd ' /proc/mounts; then
+    [ -e /mnt/sd/ssoverlay.off ] && { echo "disabled by /mnt/sd/ssoverlay.off" >>"$log"; exit 0; }
+    sdlog=/mnt/sd/ssoverlay.log
+    if [ -f "$sdlog" ] && [ "$(wc -c <"$sdlog")" -gt 1000000 ]; then
+        mv -f "$sdlog" "$sdlog.old"
+    fi
+fi
+
+md5=$(nice -n 19 md5sum "/proc/$pid/exe" | cut -d' ' -f1)
+if [ "$md5" != "$want" ]; then
+    echo "main_app md5 $md5 != $want, not starting" >>"$log"
+    [ -n "$sdlog" ] && echo "main_app md5 $md5 != $want, not starting" >>"$sdlog"
+    exit 0
+fi
+[ -n "$sdlog" ] && echo "=== boot $(date '+%Y-%m-%d %H:%M:%S') pid $pid" >>"$sdlog"
+exec nice -n 5 /usr/bin/ssoverlay "$pid" real 250 $sdlog >>"$log" 2>&1

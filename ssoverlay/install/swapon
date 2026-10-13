@@ -1,0 +1,8 @@
+#!/bin/sh
+# ssoverlay boot hook. /etc/init.d/S99_Sysctl runs "swapon /dev/zram0" with
+# /usr/bin first in PATH; this starts the overlay launcher in the background
+# and then runs the real BusyBox swapon with the original arguments.
+if [ -x /usr/bin/ssoverlay-start ] && [ ! -e /usr/bin/ssoverlay.disabled ]; then
+    /bin/sh /usr/bin/ssoverlay-start </dev/null >/dev/null 2>&1 &
+fi
+exec /sbin/swapon "$@"

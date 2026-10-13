@@ -1,0 +1,5 @@
+__pycache__/
+*.pyc
+.DS_Store
+# host-side test harness built by ssoverlay/build.sh
+ssoverlay/ssoverlay_host
