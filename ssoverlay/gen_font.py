@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """Generate font_data.h for ssoverlay from the native 28px UI font (ui_zh).
 
-Adds two procedural glyphs the native font lacks: U+00B0 (degree ring)
-and U+25CF (filled disc, used as a status dot).
+Adds procedural glyphs the native font lacks: U+00B0 (degree ring),
+U+25CF (filled disc, used as a status dot) and U+25B2 (triangle, altitude).
 """
 import math
 import sys
@@ -29,6 +29,19 @@ def ring(d, stroke):
                     dy = y + (sy + 0.5) / 4 - r_out
                     rr = math.hypot(dx, dy)
                     hit += r_in <= rr <= r_out
+            px.append(round(255 * hit / 16))
+    return px
+
+
+def triangle(w, h):
+    px = []
+    for y in range(h):
+        for x in range(w):
+            hit = 0
+            for sy in range(4):
+                for sx in range(4):
+                    fx, fy = x + (sx + 0.5) / 4, y + (sy + 0.5) / 4
+                    hit += abs(fx - w / 2) <= fy / h * w / 2
             px.append(round(255 * hit / 16))
     return px
 
@@ -81,6 +94,10 @@ def main(out):
     d = 14
     glyphs.append((0x25CF, {"adv16": (d + 4) * 16, "w": d, "h": d, "ox": 1,
                             "oy": digit["oy"] + (digit["h"] - d) // 2, "a": ring(d, d / 2)}))
+    # Altitude mark: 16x13 triangle centred on the digit height.
+    w, h = 16, 13
+    glyphs.append((0x25B2, {"adv16": (w + 4) * 16, "w": w, "h": h, "ox": 1,
+                            "oy": digit["oy"] + (digit["h"] - h) // 2, "a": triangle(w, h)}))
     glyphs += big_digits(f)
     glyphs.sort()
     codes = [c for c, _ in glyphs]

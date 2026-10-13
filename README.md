@@ -11,8 +11,9 @@ other hidden settings.
 1. **Enable Telnet** — a one-time install over USB in factory mode.
 2. **Change settings** — language, speed units, date format, time zone and
    daylight saving time, over the camera's Wi-Fi.
-3. **Screensaver overlay (optional)** — adds time, heading, GPS position and mph
-   to the speed screensaver.
+3. **Screensaver overlay (optional)** — adds time, heading, GPS position,
+   altitude, satellite count and mph to the speed screensaver, and keeps a
+   second GPS log that includes altitude.
 
 > [!IMPORTANT]
 > Only tested on the **70mai A810Pro (model DR2830), China firmware 1.2.42**.
@@ -319,16 +320,46 @@ turning DST on, on again, and off.
 
 `ssoverlay` adds to the speed screensaver:
 
+- top left, next to REC: altitude (metres above mean sea level)
 - top centre: the time
-- top right: heading and a GPS dot (green with a fix, grey without)
-- bottom left: latitude and longitude
+- top right: heading, a GPS dot (green with a fix, grey without) and the number
+  of satellites used
+- bottom left: latitude and longitude (`No GPS fix` without a fix)
 - bottom right: speed in mph
 
 It only draws while the **speed screensaver** is on screen, so select that
 screensaver in the camera's settings. It never writes to `main_app` or its
 settings. It only draws over pixels that are black or that it drew itself, so if
-a popup appears it skips that frame. On startup it checks `main_app`'s MD5 and 46
+a popup appears it skips that frame. On startup it checks `main_app`'s MD5 and 152
 code locations it depends on, and exits if anything differs.
+
+### GPS log (gpsx)
+
+The stock `GPSData*.txt` has no altitude. `ssoverlay` writes its own CSV log,
+`/mnt/sd/gpsx/GPSX.csv`, whenever it is running, whether or not the screensaver
+is showing:
+
+- One line per GPS update (1 Hz). Like the stock log it writes 5 lines at a
+  time; each batch is synced to the card and the file is closed again, so it
+  never keeps the SD card busy (formatting still works). A power cut loses at
+  most about 5 seconds.
+- At 100 MB the file is renamed to `GPSX.old.csv` and a new one is started, so
+  there are at most two files. A line is about 110 bytes, about 0.4 MB per hour.
+- Nothing is written until the GPS has a date. Without a fix `status` is `V`
+  and the position columns are empty.
+
+| Column | Meaning |
+|---|---|
+| `unix`, `utc` | GPS time (true UTC). On our camera the stock `GPSData` timestamps were 28800 s smaller |
+| `status` | `A` fix / `V` no fix |
+| `lat`, `lon` | decimal degrees, 7 decimals |
+| `alt_m` | altitude above mean sea level, metres |
+| `speed_kn`, `course` | speed over ground (knots), course (degrees; meaningless when stationary) |
+| `ui_kmh` | the speed the screensaver shows |
+| `fix_quality`, `fix_mode` | GGA fix quality; GSA 1/2/3 = none/2D/3D |
+| `sats_used`, `sats_in_view` | satellites used in the fix, satellites in view across all constellations |
+| `hdop`, `pdop`, `vdop` | dilution of precision |
+| `temp_c` | SoC temperature |
 
 ### Try it without installing
 
@@ -356,29 +387,33 @@ in either order is fine: each keeps the other's part of the file. If
 `/usr/bin/swapon` contains anything else, install stops without touching it.
 
 Logs: `/tmp/ssoverlay.log`, and `ssoverlay.log` in the root of the SD card
-(rotated at 1 MB).
+(rotated at 1 MB). The GPS log adds a line there when writing starts working or
+fails (`gpsx ok` / `gpsx error -N`).
 
 ### Turn it off or remove it
 
 - Turn it off: put an empty file named `ssoverlay.off` in the root of the SD
   card, or run `touch /usr/bin/ssoverlay.disabled` on the camera. Takes effect at
-  the next boot.
+  the next boot and stops the GPS log too.
 - Stop it now: `python3 ssoverlay/deploy.py stop`
 - Remove it: `python3 ssoverlay/deploy.py uninstall` (keeps the English-menu hook
   if you have one)
 
 ### Limitations
 
-- It's a prototype. Speed is always shown in mph, and with no GPS fix the
-  bottom-left shows `无定位` ("no fix") in Chinese.
-- Tested on the camera: live GPS data, starting at boot, and coexisting with the
-  English menu. Installing it **after** the English menu goes through new code in
-  `deploy.py`; the resulting `swapon` file is byte-for-byte the one tested on the
-  camera, but that path itself has only been run in unit tests.
+- It's a prototype. Speed is always shown in mph and altitude in metres.
+- The GPS log's 100 MB rollover hasn't been triggered on a camera yet (renaming
+  over an existing file on the SD card was checked).
+- Tested on the camera: live GPS data (positions match the stock GPS log for the
+  same second), altitude and satellite count, writing the GPS log, starting at
+  boot, and coexisting with the English menu. Installing it **after** the
+  English menu goes through new code in `deploy.py`; the resulting `swapon` file
+  is byte-for-byte the one tested on the camera, but that path itself has only
+  been run in unit tests.
 
 ### Building from source
 
-The repo includes a prebuilt `ssoverlay` (MD5 `620cef7e7313144f02a6747abfb5a405`),
+The repo includes a prebuilt `ssoverlay` (MD5 `646f7c0bf1def2e43d75cc48d5c25ba4`),
 so you don't need to build it. To rebuild you need Homebrew `llvm` and `lld`, plus
 your own copy of the camera's `main_app` (for example from `/proc/<pid>/exe`):
 the font and code fingerprints are extracted from it. `main_app` is 70mai's code,

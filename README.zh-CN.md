@@ -6,7 +6,7 @@
 
 1. **开启 Telnet**：在工厂模式下通过 USB 装一次即可。
 2. **修改设置**：通过记录仪 Wi-Fi 改界面语言、速度单位、日期格式、时区和夏令时。
-3. **屏保叠加（可选）**：在时速屏保上加显示时间、航向、GPS 坐标和 mph。
+3. **屏保叠加（可选）**：在时速屏保上加显示时间、航向、GPS 坐标、海拔、卫星数和 mph，并另写一份带海拔的 GPS 日志。
 
 > [!IMPORTANT]
 > 只在 **70mai A810Pro（型号 DR2830）国行固件 1.2.42** 上测试过。每个工具都会先检查型号和固件，不匹配就停止。
@@ -254,12 +254,34 @@ python3 telnet/macos.py --skip-version-check install
 
 `ssoverlay` 在时速屏保上增加：
 
+- 左上（REC 右侧）：海拔（米，以平均海平面为基准）
 - 顶部中间：时间
-- 右上：航向和 GPS 状态点（有定位为绿色，无定位为灰色）
-- 左下：纬度、经度
+- 右上：航向、GPS 状态点（有定位为绿色，无定位为灰色）和参与定位的卫星数
+- 左下：纬度、经度（无定位时显示 `No GPS fix`）
 - 右下：mph 车速
 
-它只在**时速屏保**显示时绘制，请在记录仪设置里选用这个屏保。它不写 `main_app` 的内存和设置，只覆盖纯黑或自己画过的像素；遇到弹窗就跳过这一帧。启动时会核对 `main_app` 的 MD5 以及它依赖的 46 处代码，不一致就退出。
+它只在**时速屏保**显示时绘制，请在记录仪设置里选用这个屏保。它不写 `main_app` 的内存和设置，只覆盖纯黑或自己画过的像素；遇到弹窗就跳过这一帧。启动时会核对 `main_app` 的 MD5 以及它依赖的 152 处代码，不一致就退出。
+
+### GPS 日志（gpsx）
+
+原厂的 `GPSData*.txt` 不记录海拔。`ssoverlay` 另写一份 CSV 日志 `/mnt/sd/gpsx/GPSX.csv`，与屏保是否显示无关，只要程序在运行就会记录：
+
+- GPS 每更新一次（1 Hz）写一行；和原厂一样每 5 行写一批，写完立即同步到卡上，写完就关闭文件，不影响格式化 SD 卡。断电最多丢约 5 秒。
+- 超过 100 MB 时改名为 `GPSX.old.csv`，再新建文件，最多保留两个文件。每行约 110 字节，约 0.4 MB/小时。
+- GPS 还没有日期时不写；没有定位时状态为 `V`，位置等列留空。
+
+| 列 | 含义 |
+|---|---|
+| `unix`、`utc` | GPS 时间（真实 UTC）。在我们的记录仪上，原厂 `GPSData` 的时间戳比它小 28800 秒 |
+| `status` | `A` 定位 / `V` 无定位 |
+| `lat`、`lon` | 十进制度，7 位小数 |
+| `alt_m` | 海拔（米，以平均海平面为基准） |
+| `speed_kn`、`course` | 对地速度（节）、航向（度），静止时航向无意义 |
+| `ui_kmh` | 屏保上显示的车速 |
+| `fix_quality`、`fix_mode` | GGA 定位质量；GSA 1/2/3 = 无/2D/3D |
+| `sats_used`、`sats_in_view` | 参与定位的卫星数、各星座可见卫星总数 |
+| `hdop`、`pdop`、`vdop` | 精度因子 |
+| `temp_c` | 机内芯片温度 |
 
 ### 不安装先试用
 
@@ -283,22 +305,23 @@ python3 ssoverlay/deploy.py install
 
 `/usr/bin/swapon` 和第二部分的英文菜单共用，第二、三部分先做哪个都行，双方会保留对方的内容。如果 `/usr/bin/swapon` 里有其他来源的内容，安装会停止，不会动它。
 
-日志：`/tmp/ssoverlay.log`，以及 SD 卡根目录的 `ssoverlay.log`（超过 1 MB 会轮换）。
+日志：`/tmp/ssoverlay.log`，以及 SD 卡根目录的 `ssoverlay.log`（超过 1 MB 会轮换）。GPS 日志写入成功或出错时会在这里记一行（`gpsx ok` / `gpsx error -N`）。
 
 ### 停用或卸载
 
-- 停用：在 SD 卡根目录放一个名为 `ssoverlay.off` 的空文件，或在记录仪上执行 `touch /usr/bin/ssoverlay.disabled`。下次开机生效。
+- 停用：在 SD 卡根目录放一个名为 `ssoverlay.off` 的空文件，或在记录仪上执行 `touch /usr/bin/ssoverlay.disabled`。下次开机生效，GPS 日志也会一起停止。
 - 立即停止：`python3 ssoverlay/deploy.py stop`
 - 卸载：`python3 ssoverlay/deploy.py uninstall`（如果装了英文菜单，会保留它的启动段）
 
 ### 局限
 
-- 目前是原型。车速固定用 mph 显示；没有定位时左下角显示中文“无定位”。
-- 实机验证过：实时 GPS 数据、开机自启、与英文菜单共存。**先装英文菜单再装屏保**会走 `deploy.py` 中新写的逻辑：生成的 `swapon` 与实机验证过的文件逐字节相同，但这条路径本身只经过单元测试。
+- 目前是原型。车速固定用 mph，海拔固定用米。
+- GPS 日志满 100 MB 换文件的逻辑还没在实机上触发过（已确认 SD 卡上改名能覆盖旧文件）。
+- 实机验证过：实时 GPS 数据（经纬度与原厂 GPS 日志同一秒的记录一致）、海拔和卫星数、GPS 日志写入、开机自启、与英文菜单共存。**先装英文菜单再装屏保**会走 `deploy.py` 中新写的逻辑：生成的 `swapon` 与实机验证过的文件逐字节相同，但这条路径本身只经过单元测试。
 
 ### 从源码编译
 
-仓库里带有编译好的 `ssoverlay`（MD5 `620cef7e7313144f02a6747abfb5a405`），一般不需要自己编译。如需重新编译，要装 Homebrew 的 `llvm` 和 `lld`，还需要自己从记录仪取一份 `main_app`（例如 `/proc/<pid>/exe`），字体和代码指纹都从它提取。`main_app` 是 70mai 的代码，不包含在本仓库中。
+仓库里带有编译好的 `ssoverlay`（MD5 `646f7c0bf1def2e43d75cc48d5c25ba4`），一般不需要自己编译。如需重新编译，要装 Homebrew 的 `llvm` 和 `lld`，还需要自己从记录仪取一份 `main_app`（例如 `/proc/<pid>/exe`），字体和代码指纹都从它提取。`main_app` 是 70mai 的代码，不包含在本仓库中。
 
 ```sh
 MAIN_APP_ELF=/path/to/main_app ./ssoverlay/build.sh

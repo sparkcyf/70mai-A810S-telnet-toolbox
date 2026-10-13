@@ -4,7 +4,8 @@
  * Prototype. Runs as a separate process: reads main_app memory through
  * /proc/<pid>/mem (read-only) to decide whether the speed screensaver page is
  * the active LVGL page, and only then draws into the blank bands of /dev/fb0.
- * It never writes to main_app memory or any file.
+ * In real mode it also appends one CSV line per GPS epoch to /mnt/sd/gpsx/
+ * (see "gpsx" below). It never writes to main_app memory.
  *
  * Build: see build.sh. -DHOST builds a test harness that renders into a
  * framebuffer snapshot instead of the device.
@@ -51,6 +52,10 @@ static long sc6(long n, long a, long b, long c, long d, long e, long f)
 #define NR_clock_gettime 263
 #define NR_rt_sigaction 174
 #define NR_lseek 19
+#define NR_rename 38
+#define NR_mkdir 39
+#define NR_fsync 118
+#define NR_stat64 195
 #define sys_write(fd, b, n) SC(NR_write, fd, b, n)
 
 void *memset(void *d, int c, unsigned long n)
@@ -125,19 +130,6 @@ static void log_kv(const char *k, u32 v)
     *p++ = '\n';
     log_write(b, p - b);
 }
-static void log_line(const char *k, const s32 *v, int n)
-{
-    char b[256], *p = b;
-    for (const char *q = k; *q; q++) *p++ = *q;
-    for (int i = 0; i < n; i++) {
-        *p++ = ' ';
-        s32 x = v[i];
-        if (x < 0) { *p++ = '-'; x = -x; }
-        p = put_u(p, (u32)x, 1);
-    }
-    *p++ = '\n';
-    log_write(b, p - b);
-}
 static int parse_int(const char *s)
 {
     int v = 0;
@@ -167,6 +159,24 @@ static int parse_int(const char *s)
 #define G_KN      12  /* speed over ground, knots: words 12, 13 */
 #define G_CRS     14  /* course over ground, degrees: words 14, 15 */
 #define G_WORDS   16
+/* Rest of the batch, mapped from the parser (0xf2518) and checked live:
+ * RMC 4 = fractional s, 5..7 = day, month, yy; GGA 18..21 = time,
+ * 26 = fix quality, 27 = satellites used, 28/29 = HDOP, 30/31 = altitude MSL m,
+ * 33/34 = geoid separation; GSA 48 = 1/2/3 (none/2D/3D), 61..66 = PDOP, HDOP,
+ * VDOP; GSV blocks of 76 words at 76, 152, 228, 304, 380 (GP, GB, GA, GL, GQ),
+ * each {total msgs, msg no, satellites in view, 4 x (prn, elev, azim, snr)} x 4. */
+#define G_DAY     5
+#define G_FIXQ    26
+#define G_SATS    27
+#define G_HDOP    28
+#define G_ALT     30
+#define G_MODE    48
+#define G_PDOP    61
+#define G_VDOP    65
+#define G_GSV     76
+#define G_GSV_LEN 76
+#define G_NGSV    5
+#define GB_WORDS  (0x78c / 4)
 
 static int memfd = -1;
 
@@ -343,6 +353,8 @@ struct info {
     s32 lat_e5, lon_e5; /* degrees * 1e5, signed */
     int course;         /* degrees 0..359, -1 unknown */
     int speed_kmh;      /* -1 unknown */
+    int alt_ok, alt_m;  /* GGA altitude above mean sea level, whole metres */
+    int sats;           /* satellites used, -1 unknown */
     int hh, mm;         /* local time */
 };
 
@@ -366,6 +378,9 @@ static void fake_info(struct info *in, u32 t)
     in->lon_e5 = -11207404 - ph * 5;      /* W 112.07404 */
     in->course = (int)((t * 6) % 360);    /* rotates once a minute */
     in->speed_kmh = 48;
+    in->alt_ok = 1;
+    in->alt_m = 331;                      /* Phoenix */
+    in->sats = 23;
 }
 
 /* ddmm.mmmm {value, scale} -> degrees * 1e5, integer only. Returns -1 if unusable. */
@@ -394,37 +409,51 @@ static u32 mono_s(void)
 #endif
 }
 
-static u32 g_raw[G_WORDS];
 static int last_course = -1;
 static u32 last_hms = 0xffffffff, hms_changed_at;
 
-static void real_info(struct info *in)
+/* Read the whole parsed batch; two identical reads in a row, so a copy
+ * caught in the middle of main_app's memcpy is rejected. 0 on success. */
+static u32 gtmp[GB_WORDS];
+static int read_gps(u32 *a)
 {
-    u32 a[G_WORDS], b[G_WORDS], ui;
+    for (int tries = 0; tries < 3; tries++) {
+        if (rdn(A_GPS, a, GB_WORDS) || rdn(A_GPS, gtmp, GB_WORDS)) return -1;
+        int i = 0;
+        while (i < GB_WORDS && a[i] == gtmp[i]) i++;
+        if (i == GB_WORDS) return 0;
+    }
+    return -1;
+}
+
+static void real_info(struct info *in, const u32 *a, int have)
+{
+    u32 ui;
     in->valid = 0;
     in->course = -1;
     in->speed_kmh = -1;
     in->lat_e5 = in->lon_e5 = 0;
+    in->alt_ok = 0;
+    in->sats = -1;
     if (!rd(A_UI_SPEED, &ui) && ui < 1000) in->speed_kmh = (int)ui;
-    int ok = 0;
-    for (int tries = 0; tries < 3 && !ok; tries++) {   /* reject torn copies */
-        if (rdn(A_GPS, a, G_WORDS) || rdn(A_GPS, b, G_WORDS)) return;
-        ok = 1;
-        for (int i = 0; i < G_WORDS; i++) if (a[i] != b[i]) { ok = 0; break; }
-    }
-    if (!ok) return;
-    memcpy(g_raw, a, sizeof a);
+    if (!have) return;
     /* staleness: GPS UTC time must keep advancing */
     u32 hms = a[G_HH] * 3600 + a[G_HH + 1] * 60 + a[G_HH + 2];
     u32 now = mono_s();
     if (hms != last_hms) { last_hms = hms; hms_changed_at = now; }
     if (now - hms_changed_at > 5) return;
+    if (a[G_SATS] < 100) in->sats = (int)a[G_SATS];
     if (a[G_VALID] != 1) return;
     if (nmea_to_e5((s32)a[G_LAT], (s32)a[G_LAT + 1], &in->lat_e5) ||
         nmea_to_e5((s32)a[G_LON], (s32)a[G_LON + 1], &in->lon_e5))
         return;
     if (in->lat_e5 > 9000000 || in->lat_e5 < -9000000) return;
     in->valid = 1;
+    s32 av = (s32)a[G_ALT], as = (s32)a[G_ALT + 1];
+    if (a[G_FIXQ] >= 1 && as > 0 && av > -1000 * as && av < 10000 * as) {
+        in->alt_ok = 1;
+        in->alt_m = av >= 0 ? (av + as / 2) / as : -((-av + as / 2) / as);
+    }
     s32 cv = (s32)a[G_CRS], cs = (s32)a[G_CRS + 1];
     int crs = -1;
     if (cs > 0 && cv >= 0) crs = (int)(((u32)cv + (u32)cs / 2) / (u32)cs) % 360;
@@ -432,6 +461,187 @@ static void real_info(struct info *in)
     if (crs >= 0 && (in->speed_kmh < 0 || in->speed_kmh >= 3)) last_course = crs;
     in->course = last_course >= 0 ? last_course : crs;
 }
+
+/* ------------------------------------------------------------------ gpsx */
+/* One CSV line per GPS epoch (1 Hz), independent of the screensaver.
+ * Batches of GX_BATCH lines like main_app's own GPSData writer, appended with
+ * open/write/fsync/close so the SD card is never held open (format/unmount).
+ * GX_CUR rolls over to GX_OLD at GX_MAX bytes: at most two files. */
+#define GX_DIR   "/mnt/sd/gpsx"
+#define GX_CUR   GX_DIR "/GPSX.csv"
+#define GX_OLD   GX_DIR "/GPSX.old.csv"
+#define GX_MAX   (100u * 1024 * 1024)
+#define GX_BATCH 5
+#define GX_HEADER "unix,utc,status,lat,lon,alt_m,speed_kn,course,ui_kmh,fix_quality,fix_mode," \
+                  "sats_used,hdop,pdop,vdop,sats_in_view,temp_c\n"
+
+/* {value, 10^k} -> decimal text with k decimals; nothing when scale is 0 (empty NMEA field) */
+static char *put_fixed(char *p, s32 v, s32 sc)
+{
+    if (sc <= 0) return p;
+    int k = 0;
+    for (s32 t = sc; t > 1; t /= 10) k++;
+    u32 a = v < 0 ? -(u32)v : (u32)v;
+    if (v < 0) *p++ = '-';
+    p = put_u(p, a / (u32)sc, 1);
+    if (k) { *p++ = '.'; p = put_u(p, a % (u32)sc, k); }
+    return p;
+}
+
+/* ddmm.mmmmm {value, scale} -> degrees * 1e7 (minutes carry 5 decimals, ~2 cm) */
+static int nmea_to_e7(s32 v, s32 sc, s32 *out)
+{
+    if (sc <= 0) return -1;
+    while (sc > 10000000) { v /= 10; sc /= 10; }
+    u32 a = v < 0 ? -(u32)v : (u32)v;
+    u32 s = (u32)sc;
+    u32 deg = a / (100 * s);
+    u32 rem = a - deg * 100 * s;
+    if (deg > 180 || rem >= 60 * s) return -1;
+    u32 e7 = deg * 10000000u + (rem * (10000000u / s) + 30) / 60;
+    *out = v < 0 ? -(s32)e7 : (s32)e7;
+    return 0;
+}
+static char *put_deg7(char *p, const u32 *g, int w)
+{
+    s32 e7;
+    if (nmea_to_e7((s32)g[w], (s32)g[w + 1], &e7)) return p;
+    u32 a = e7 < 0 ? -(u32)e7 : (u32)e7;
+    if (e7 < 0) *p++ = '-';
+    p = put_u(p, a / 10000000u, 1);
+    *p++ = '.';
+    return put_u(p, a % 10000000u, 7);
+}
+
+/* RMC date + time -> Unix seconds; -1 while the receiver has no date yet */
+static int gps_unix(const u32 *g, u32 *out)
+{
+    u32 d = g[G_DAY], mo = g[G_DAY + 1], yy = g[G_DAY + 2];
+    u32 h = g[G_HH], mi = g[G_HH + 1], se = g[G_HH + 2];
+    if (d < 1 || d > 31 || mo < 1 || mo > 12 || yy > 99 || h > 23 || mi > 59 || se > 60) return -1;
+    int y = 2000 + (int)yy - (mo <= 2);            /* days_from_civil (H. Hinnant) */
+    int era = y / 400, yoe = y - era * 400;
+    int doy = (153 * ((int)mo + (mo > 2 ? -3 : 9)) + 2) / 5 + (int)d - 1;
+    int days = era * 146097 + yoe * 365 + yoe / 4 - yoe / 100 + doy - 719468;
+    *out = (u32)days * 86400u + h * 3600 + mi * 60 + se;
+    return 0;
+}
+
+static int gx_format(char *b, const u32 *g, u32 ut, int kmh, int temp_ok, int temp)
+{
+    char *p = b;
+    p = put_u(p, ut, 1); *p++ = ',';
+    p = put_u(p, 2000 + g[G_DAY + 2], 4); *p++ = '-';
+    p = put_u(p, g[G_DAY + 1], 2); *p++ = '-';
+    p = put_u(p, g[G_DAY], 2); *p++ = ' ';
+    p = put_u(p, g[G_HH], 2); *p++ = ':';
+    p = put_u(p, g[G_HH + 1], 2); *p++ = ':';
+    p = put_u(p, g[G_HH + 2], 2); *p++ = ',';
+    *p++ = g[G_VALID] == 1 ? 'A' : 'V'; *p++ = ',';
+    p = put_deg7(p, g, G_LAT); *p++ = ',';
+    p = put_deg7(p, g, G_LON); *p++ = ',';
+    p = put_fixed(p, (s32)g[G_ALT], (s32)g[G_ALT + 1]); *p++ = ',';
+    p = put_fixed(p, (s32)g[G_KN], (s32)g[G_KN + 1]); *p++ = ',';
+    p = put_fixed(p, (s32)g[G_CRS], (s32)g[G_CRS + 1]); *p++ = ',';
+    if (kmh >= 0) p = put_u(p, (u32)kmh, 1);
+    *p++ = ',';
+    p = put_u(p, g[G_FIXQ] < 10 ? g[G_FIXQ] : 0, 1); *p++ = ',';
+    p = put_u(p, g[G_MODE] < 4 ? g[G_MODE] : 0, 1); *p++ = ',';
+    p = put_u(p, g[G_SATS] < 100 ? g[G_SATS] : 0, 1); *p++ = ',';
+    p = put_fixed(p, (s32)g[G_HDOP], (s32)g[G_HDOP + 1]); *p++ = ',';
+    p = put_fixed(p, (s32)g[G_PDOP], (s32)g[G_PDOP + 1]); *p++ = ',';
+    p = put_fixed(p, (s32)g[G_VDOP], (s32)g[G_VDOP + 1]); *p++ = ',';
+    u32 view = 0;
+    for (int k = 0; k < G_NGSV; k++) {
+        const u32 *h = g + G_GSV + k * G_GSV_LEN;
+        if (h[0] >= 1 && h[0] <= 4 && h[2] < 100) view += h[2];
+    }
+    p = put_u(p, view, 1); *p++ = ',';
+    if (temp_ok) {
+        if (temp < 0) { *p++ = '-'; temp = -temp; }
+        p = put_u(p, (u32)temp, 1);
+    }
+    *p++ = '\n';
+    return (int)(p - b);
+}
+
+#ifndef HOST
+static char gx_buf[(GX_BATCH + 1) * 256];
+static int gx_len, gx_n;
+static u32 gx_last_unix, gx_first_at, gx_temp_at;
+static int gx_temp, gx_temp_ok;
+static long gx_err = 1;  /* unknown: first result is always logged */
+
+static int sd_mounted(void)
+{
+    u32 a[26], b[26];  /* struct stat64, st_dev first */
+    if (SC(NR_stat64, "/mnt/sd", a, 0) || SC(NR_stat64, "/mnt", b, 0)) return 0;
+    return a[0] != b[0] || a[1] != b[1];
+}
+
+static void read_temp(void)
+{
+    char b[16];
+    gx_temp_ok = 0;
+    int fd = SC(NR_open, "/sys/class/thermal/thermal_zone0/temp", 0, 0);
+    if (fd < 0) return;
+    long n = SC(NR_read, fd, b, sizeof b - 1);
+    SC(NR_close, fd, 0, 0);
+    if (n <= 0) return;
+    b[n] = 0;
+    int neg = b[0] == '-';
+    if (!(b[neg] >= '0' && b[neg] <= '9')) return;
+    int t = parse_int(b + neg);
+    if (t > 1000) t = (t + 500) / 1000;  /* millidegrees on other kernels */
+    gx_temp = neg ? -t : t;
+    gx_temp_ok = 1;
+}
+
+static void gx_flush(void)
+{
+    long err = -1;
+    if (gx_len && sd_mounted()) {
+        SC(NR_mkdir, GX_DIR, 0777, 0);
+        int fd = SC(NR_open, GX_CUR, 1 | 0100 | 02000 /* WRONLY|CREAT|APPEND */, 0644);
+        long size = fd >= 0 ? SC(NR_lseek, fd, 0, 2 /* SEEK_END */) : -1;
+        if (fd >= 0 && size >= (long)GX_MAX) {
+            SC(NR_close, fd, 0, 0);
+            SC(NR_rename, GX_CUR, GX_OLD, 0);  /* replaces the previous old file */
+            fd = SC(NR_open, GX_CUR, 1 | 0100 | 01000 | 02000 /* ...|TRUNC */, 0644);
+            size = 0;
+        }
+        if (fd >= 0) {
+            err = 0;
+            if (size == 0) SC(NR_write, fd, GX_HEADER, slen(GX_HEADER));
+            if (SC(NR_write, fd, gx_buf, gx_len) != gx_len) err = -2;
+            SC(NR_fsync, fd, 0, 0);
+            SC(NR_close, fd, 0, 0);
+        } else {
+            err = fd;
+        }
+    }
+    if (gx_len && err != gx_err) {  /* log only changes: 0 ok, -1 no SD, <0 errno */
+        if (err < 0) log_kv("gpsx error -", (u32)-err); else puts2("gpsx ok\n");
+        gx_err = err;
+    }
+    gx_len = gx_n = 0;
+}
+
+static void gx_tick(const u32 *g, int have)
+{
+    u32 now = mono_s(), t;
+    if (have && !gps_unix(g, &t) && t != gx_last_unix) {
+        gx_last_unix = t;
+        if (!gx_temp_at || now - gx_temp_at >= 5) { read_temp(); gx_temp_at = now; }
+        u32 ui;
+        int kmh = !rd(A_UI_SPEED, &ui) && ui < 1000 ? (int)ui : -1;
+        if (!gx_n) gx_first_at = now;
+        gx_len += gx_format(gx_buf + gx_len, g, t, kmh, gx_temp_ok, gx_temp);
+        if (++gx_n >= GX_BATCH) gx_flush();
+    }
+    if (gx_n && now - gx_first_at >= 10) gx_flush();  /* GPS stalled: don't sit on lines */
+}
+#endif
 
 static const char *compass8(int deg)
 {
@@ -499,19 +709,33 @@ static void compose(const struct info *in)
     p = b; p = put_u(p, (u32)in->hh, 2); *p++ = ':'; p = put_u(p, (u32)in->mm, 2); *p = 0;
     text_at(320, 66, AL_CENTER, b, C_WHITE);
 
-    /* top-right: course + fix indicator */
+    /* top-right: course, then fix dot + satellites used */
+    char s[8] = "";
+    if (in->sats >= 0) { s[0] = ' '; p = put_u(s + 1, (u32)in->sats, 1); *p = 0; }
     if (in->valid && in->course >= 0) {
         p = put_u(b, (u32)in->course, 1);
         *p++ = (char)0xc2; *p++ = (char)0xb0; *p++ = ' ';
         p = put_s(p, compass8(in->course));
-        p = put_s(p, "  "); *p = 0;
-        int x = 626 - (text_w16(b) + text_w16("●") + 15) / 16;
-        x = draw_text(x, 66, b, C_LIGHT);
-        draw_text(x, 66, "●", C_GREEN);
+        p = put_s(p, "   ");
     } else {
-        int x = 626 - (text_w16("GPS ●") + 15) / 16;
-        x = draw_text(x, 66, "GPS ", in->valid ? C_LIGHT : C_DIM);
-        draw_text(x, 66, "●", in->valid ? C_GREEN : C_DIM);
+        p = put_s(b, "GPS ");
+    }
+    *p = 0;
+    u32 cdot = in->valid ? C_GREEN : C_DIM, ctxt = in->valid ? C_LIGHT : C_DIM;
+    int x = 626 - (text_w16(b) + text_w16("●") + text_w16(s) + 15) / 16;
+    x = draw_text(x, 66, b, ctxt);
+    x = draw_text(x, 66, "●", cdot);
+    draw_text(x, 66, s, ctxt);
+
+    /* top-left, right of REC: altitude */
+    if (in->valid && in->alt_ok) {
+        p = b;
+        if (in->alt_m < 0) *p++ = '-';
+        p = put_u(p, (u32)(in->alt_m < 0 ? -in->alt_m : in->alt_m), 1);
+        *p = 0;
+        x = draw_text(104, 66, "▲", C_GRAY);   /* glyph advance leaves a 5 px gap */
+        x = draw_text(x, 66, b, C_LIGHT);
+        draw_text(x, 66, " m", C_GRAY);
     }
 
     /* bottom-left: latitude / longitude (signed values -> N/S, E/W) */
@@ -522,7 +746,7 @@ static void compose(const struct info *in)
         p = put_coord(b, in->lon_e5, 'E', 'W'); *p = 0;
         draw_text(x0, LTOP(BASE), b, C_LIGHT);
     } else {
-        draw_text(x0, LTOP(BASE), "无定位", C_DIM);
+        draw_text(x0, LTOP(BASE), "No GPS fix", C_DIM);
     }
 
     /* bottom-right: mph with scaled native digits, right-aligned */
@@ -607,6 +831,18 @@ static void local_hm(u32 t, struct info *in)
 int main(int argc, char **argv)
 {
     if (argc < 3) return 2;
+    if (!strcmp(argv[1], "gpsline")) {  /* ssoverlay_host gpsline batch.bin: print gpsx line */
+        static u32 g[GB_WORDS];
+        char b[512];
+        FILE *f = fopen(argv[2], "rb");
+        if (!f || fread(g, 4, GB_WORDS, f) != GB_WORDS) return 1;
+        fclose(f);
+        u32 t;
+        if (gps_unix(g, &t)) { fprintf(stderr, "no date\n"); return 1; }
+        fputs(GX_HEADER, stdout);
+        fwrite(b, 1, gx_format(b, g, t, 26, 1, 52), stdout);
+        return 0;
+    }
     static u32 buf[FB_W * FB_H];
     FILE *f = fopen(argv[1], "rb");
     if (!f || fread(buf, 4, FB_W * FB_H, f) != FB_W * FB_H) return 1;
@@ -615,7 +851,9 @@ int main(int argc, char **argv)
     struct info in;
     u32 t = argc > 3 ? (u32)atol(argv[3]) : now_s();
     fake_info(&in, t);
-    if (argc > 4 && argv[4][0] == 'n') in.valid = 0;
+    if (argc > 4 && argv[4][0] == 'n') { in.valid = 0; in.sats = 2; }
+    if (argc > 4 && argv[4][0] == 'h') { in.alt_m = 4321; in.course = 315; }  /* widest top bar */
+    if (argc > 4 && argv[4][0] == 'l') { in.alt_m = -86; }                    /* below sea level */
     if (argc > 4 && argv[4][0] == 'c') { calib = 1; NREG = 4; }
     local_hm(t, &in);
     compose(&in);
@@ -731,10 +969,15 @@ static int run(int argc, char **argv)
 
     if (argc > 2 && argv[2][0] == 'c' && argv[2][1] == 'l') return clean();
 
-    int was = -1, ticks = 0, last_valid = -1, raw_lines = 0;
-    u32 last_raw_log = 0;
+    int was = -1, ticks = 0;
+    static u32 gps[GB_WORDS];
     cb_reset();
     while (!stop) {
+        int have = 0;
+        if (!fake && !calib) {
+            have = !read_gps(gps);
+            gx_tick(gps, have);
+        }
         int act = saver_active();
         if (act) {
             struct info in;
@@ -743,20 +986,7 @@ static int run(int argc, char **argv)
                 fake_info(&in, t);
                 if (nofix) in.valid = 0;
             } else {
-                real_info(&in);
-                /* raw log for checking the fixed-point decoding on the road:
-                 * on fix changes and once a minute, at most 2000 lines */
-                u32 nm = mono_s();
-                if (raw_lines < 2000 && (in.valid != last_valid || nm - last_raw_log >= 60)) {
-                    s32 v[21];
-                    v[0] = (s32)t;
-                    for (int i = 0; i < G_WORDS; i++) v[1 + i] = (s32)g_raw[i];
-                    v[17] = in.lat_e5; v[18] = in.lon_e5; v[19] = in.course; v[20] = in.speed_kmh;
-                    log_line("gps epoch raw[0..15] lat_e5 lon_e5 crs kmh:", v, 21);
-                    last_valid = in.valid;
-                    last_raw_log = nm;
-                    raw_lines++;
-                }
+                real_info(&in, gps, have);
             }
             local_hm(t, &in);
             compose(&in);
@@ -781,6 +1011,7 @@ static int run(int argc, char **argv)
         sleep_ms(interval);
     }
     if (saver_active()) erase();
+    gx_flush();
     puts2("exit\n");
     return 0;
 }
